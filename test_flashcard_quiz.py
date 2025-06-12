@@ -1,37 +1,36 @@
 #!/usr/bin/env python
 """
-flashcard_smoketest.py
+test_flashcard_quiz.py
 ──────────────────────
-Quick functional smoke-test for Language-Learner-Tools flash-card quizzes.
+Self-contained smoke-tester for Language-Learner-Tools “flash-card” quizzes.
 
-• Runs each target page up to N categories (first categories shown)
-• Plays a few rounds, simulating one “too-early” click to expose race-conditions
-• Prints coloured PASS / FAIL / SKIP lines plus a summary table
-• 0 exit-code  → all passed / skipped
-  non-zero     → at least one hard failure
-
-Usage
-─────
-$ python flashcard_smoketest.py            # uses headless browser
-$ LLTOOLS_HEADLESS=0 python flashcard_smoketest.py  # shows Chrome window
+  • Launches Chrome (headless by default, --show for GUI)
+  • Tests the first N categories on each supplied page
+  • Clicks *immediately* once (to expose race-conditions), then after audio
+  • Prints PASS / FAIL / SKIP for every (page, category) combo
+  • On FAIL or SKIP shows a compact step-by-step trace
+  • Suppresses DevTools / absl / TensorFlow chatter
+  • Handles connection errors and Ctrl-C gracefully
 """
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import os
 import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import urlparse
 
-# ─── third-party ────────────────────────────────────────────────────────────
+# ─── third-party ──────────────────────────────────────────────────────────
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
     StaleElementReferenceException,
     TimeoutException,
+    WebDriverException,
 )
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.chrome.service import Service
@@ -41,83 +40,117 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 try:
-    from colorama import Fore, Style, init as colorama_init
+    from colorama import Fore, Style, init as _cinit
 
-    colorama_init()
-    C_PASS, C_FAIL, C_SKIP, C_RESET = (
-        Fore.GREEN,
-        Fore.RED,
-        Fore.YELLOW,
-        Style.RESET_ALL,
-    )
-except ModuleNotFoundError:  # colour is optional
-    C_PASS = C_FAIL = C_SKIP = C_RESET = ""
+    _cinit()
+    _COLOUR = True
+except ModuleNotFoundError:  # colour optional
+    _COLOUR = False
+    Fore = Style = type("Dummy", (), {"GREEN": "", "RED": "", "YELLOW": "", "RESET_ALL": ""})
 
 
-# ─── CONFIG ─────────────────────────────────────────────────────────────────
-
+# ─── CONFIG ───────────────────────────────────────────────────────────────
 QUIZ_PAGES = [
-    "https://starter-english-test.local/home/",          # local dev first
+    "https://starter-english-test.local/home/",
     "https://www.turkishtextbook.com/vocab-lessons/",
     "https://starterenglish.com/",
     "https://wordboat.com/biblical-hebrew/",
 ]
 
-MAX_CATEGORY_TESTS = 4  # first N categories per site
+MAX_CATEGORY_TESTS = 5           # first N categories per site
 ROUNDS_PER_RUN = 3
 MAX_PAGE_LOAD_SEC = 20
 MAX_ROUND_SEC = 25
-ROUND_START_DELAY = 0.2         # seconds after audio ≥0.4 s
-
-# ─── INTERNAL TYPES ────────────────────────────────────────────────────────
+ROUND_START_DELAY = 0.2          # after audio reached ≥0.4 s
 
 
-class SkipTest(Exception):
-    """Raised when a particular (url, category) cannot be run but is not a fail."""
+# ─── small helpers ────────────────────────────────────────────────────────
+class StepLog:
+    """Collects *successful* milestones so we can print them after a failure."""
+
+    def __init__(self) -> None:
+        self._steps: List[str] = []
+
+    def add(self, msg: str) -> None:
+        self._steps.append(msg)
+
+    def dump(self) -> str:
+        return "\n    ".join(self._steps)
+
+
+def _short_exc(ex: Exception, maxlen: int = 160) -> str:
+    txt = str(ex).strip().splitlines()[0]
+    return txt[: maxlen - 1] + "…" if len(txt) > maxlen else txt
+
+
+def _colour(s: str, col: str) -> str:
+    return f"{col}{s}{Style.RESET_ALL}" if _COLOUR else s
+
+
+def _host_short(url: str) -> str:
+    h = urlparse(url).hostname or "site"
+    return h.replace("www.", "").split(".")[0]
 
 
 @dataclass
 class Result:
     url: str
     category: int
-    verdict: str   # "PASS" | "FAIL" | "SKIP"
+    verdict: str   # PASS | FAIL | SKIP
     detail: str
     elapsed: float
+    steps: StepLog
 
 
-# ─── BROWSER HANDLING ──────────────────────────────────────────────────────
+class SkipTest(Exception):
+    """Raised when a test should be skipped without counting as failure."""
 
 
+# ─── Selenium helpers ─────────────────────────────────────────────────────
 @contextmanager
-def browser(headless: bool | None = None):
-    if headless is None:
-        headless = os.getenv("LLTOOLS_HEADLESS", "1") != "0"
+def browser(headless: bool, quiet: bool = True):
+    """
+    Spin up Chrome → yield driver → quit.
 
+    When *quiet* is True, **both** stdout & stderr of Chromedriver/Chrome are
+    sent to os.devnull for the whole session, killing DevTools / absl noise.
+    """
     opts = ChromeOptions()
     if headless:
         opts.add_argument("--headless=new")
     opts.add_argument("--window-size=1400,1000")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--log-level=3")
+    opts.add_argument("--disable-logging")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
 
-    drv = Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    devnull = open(os.devnull, "w") if quiet else None  # keep handle open
+    redir_out = contextlib.redirect_stdout(devnull) if quiet else contextlib.nullcontext()
+    redir_err = contextlib.redirect_stderr(devnull) if quiet else contextlib.nullcontext()
+
+    with redir_out, redir_err:
+        try:
+            service = Service(
+                ChromeDriverManager().install(),
+                log_output=devnull if quiet else None,  # type: ignore[arg-type]
+            )
+            drv = Chrome(service=service, options=opts)
+        except Exception as ex:
+            if devnull:
+                devnull.close()
+            raise SkipTest(_short_exc(ex))
+
     try:
         yield drv
     finally:
         drv.quit()
-
-
-# ─── UTILS ─────────────────────────────────────────────────────────────────
+        if devnull:
+            devnull.close()
 
 
 def wait_click(drv, by, value, timeout=MAX_PAGE_LOAD_SEC):
-    elm = WebDriverWait(drv, timeout).until(
-        EC.element_to_be_clickable((by, value))
-    )
-    drv.execute_script(
-        "arguments[0].scrollIntoView({block:'center',inline:'center'});", elm
-    )
+    elm = WebDriverWait(drv, timeout).until(EC.element_to_be_clickable((by, value)))
+    drv.execute_script("arguments[0].scrollIntoView({block:'center',inline:'center'});", elm)
     elm.click()
     return elm
 
@@ -130,11 +163,11 @@ def flashcards_visible(drv, min_cards=2) -> bool:
 def wait_pointer_enabled(drv, timeout=5):
     start = time.time()
     while time.time() - start < timeout:
-        style = drv.execute_script(
+        pe = drv.execute_script(
             "var c=document.querySelector('#ll-tools-flashcard');"
             "return c?getComputedStyle(c).pointerEvents:null;"
         )
-        if style and style != "none":
+        if pe and pe != "none":
             return
         time.sleep(0.1)
     raise TimeoutException("pointer-events never enabled")
@@ -153,73 +186,72 @@ def wait_audio_played(drv, min_time=0.4, timeout=5):
     raise TimeoutException("audio never reached {:.1f}s".format(min_time))
 
 
-def choose_single_category(drv, idx: int):
-    checkboxes = drv.find_elements(
-        By.CSS_SELECTOR,
-        "#ll-tools-category-checkboxes input[type='checkbox']",
+def choose_single_category(drv, idx: int, log: StepLog):
+    boxes = drv.find_elements(
+        By.CSS_SELECTOR, "#ll-tools-category-checkboxes input[type='checkbox']"
     )
-    if not checkboxes:
+    if not boxes:
         raise SkipTest("page auto-starts without category picker")
 
-    if idx >= len(checkboxes):
-        raise SkipTest(f"only {len(checkboxes)} categories on page")
+    if idx >= len(boxes):
+        raise SkipTest(f"only {len(boxes)} categories on page")
 
-    for cb in checkboxes:
+    for cb in boxes:
         if cb.is_selected():
             cb.click()
-    checkboxes[idx].click()
+    boxes[idx].click()
+    log.add(f"category #{idx} selected")
 
     start_btn = drv.find_element(By.ID, "ll-tools-start-selected-quiz")
     if not start_btn.is_enabled():
         raise SkipTest("Start button disabled after category change")
     start_btn.click()
+    log.add("quiz started")
 
 
-def early_click_first_card(drv):
+def early_click_first_card(drv, log: StepLog):
     for c in drv.find_elements(By.CSS_SELECTOR, ".flashcard-container"):
         try:
             if c.is_displayed():
                 c.click()
+                log.add("early click sent")
                 return
         except (StaleElementReferenceException, ElementClickInterceptedException):
             continue
 
 
-# ─── CORE SINGLE-RUN FUNCTION ─────────────────────────────────────────────
+# ─── core test routine ────────────────────────────────────────────────────
+def run_quiz(url: str, cat_idx: int, log: StepLog, headless: bool):
+    with browser(headless=headless) as d:
+        try:
+            d.get(url)
+            log.add("page loaded")
+        except WebDriverException as ex:
+            raise SkipTest(_short_exc(ex))
 
-
-def run_quiz(url: str, cat_idx: int) -> None:
-    """
-    Raises
-    ------
-    SkipTest
-        the combination cannot be executed (not an error)
-    Exception
-        any hard failure
-    """
-    with browser() as d:
-        d.get(url)
-
+        # open quiz popup
         try:
             wait_click(d, By.ID, "ll-tools-start-flashcard")
+            log.add("start-button clicked")
         except TimeoutException:
-            pass  # some embeds show popup instantly
+            log.add("start-button not present (auto popup)")
 
-        choose_single_category(d, cat_idx)
+        choose_single_category(d, cat_idx, log)
 
-        for round_no in range(1, ROUNDS_PER_RUN + 1):
+        for rnd in range(1, ROUNDS_PER_RUN + 1):
             if not WebDriverWait(d, MAX_ROUND_SEC).until(flashcards_visible):
-                raise RuntimeError(f"round {round_no}: flashcards never appeared")
+                raise RuntimeError(f"round {rnd}: flashcards never appeared")
+            log.add(f"round {rnd} cards visible")
 
-            # provoke race condition
-            early_click_first_card(d)
-
+            early_click_first_card(d, log)
             wait_pointer_enabled(d)
             wait_audio_played(d)
+            log.add(f"round {rnd} audio ≥0.4 s")
+
             time.sleep(ROUND_START_DELAY)
 
-            start_ts = time.time()
-            while time.time() - start_ts < MAX_ROUND_SEC:
+            t0 = time.time()
+            while time.time() - t0 < MAX_ROUND_SEC:
                 cards = d.find_elements(By.CSS_SELECTOR, ".flashcard-container")
                 progress = False
                 for c in cards:
@@ -234,66 +266,74 @@ def run_quiz(url: str, cat_idx: int) -> None:
                 if not progress or not flashcards_visible(d):
                     break
             else:
-                raise RuntimeError(f"round {round_no}: never completed")
+                raise RuntimeError(f"round {rnd}: never completed")
+            log.add(f"round {rnd} completed")
 
 
-# ─── RUNNER ────────────────────────────────────────────────────────────────
+# ─── CLI / runner ─────────────────────────────────────────────────────────
+def _case_matrix() -> List[Tuple[str, int]]:
+    return [(u, ci) for u in QUIZ_PAGES for ci in range(MAX_CATEGORY_TESTS)]
 
 
-def param_matrix() -> List[Tuple[str, int]]:
-    return [
-        (u, ci)
-        for u in QUIZ_PAGES
-        for ci in range(MAX_CATEGORY_TESTS)
-    ]
+def _argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Flash-card quiz smoke-tester")
+    p.add_argument("--show", action="store_true", help="run with visible Chrome")
+    p.add_argument("--no-colour", action="store_true", help="disable ANSI colours")
+    return p
 
 
-def host_short(url: str) -> str:
-    h = urlparse(url).hostname or "site"
-    h = h.replace("www.", "").split(".")[0]
-    return h
+def _print_result(label: str, res: Result):
+    col = {"PASS": Fore.GREEN, "FAIL": Fore.RED, "SKIP": Fore.YELLOW}.get(res.verdict, "")
+    print(f"{label:<28} … {_colour(res.verdict, col)} ({res.elapsed:5.1f}s) {res.detail}")
+    if res.verdict != "PASS":
+        for line in res.steps.dump().splitlines():
+            print(f"    {line}")
 
 
-def main() -> None:
-    results: List[Result] = []
-    total_start = time.time()
+def main(argv: List[str] | None = None) -> None:
+    args = _argparser().parse_args(argv)
+    if args.no_colour or not _COLOUR:
+        for attr in vars(Fore) | vars(Style):
+            if isinstance(getattr(Fore, attr, ""), str):
+                setattr(Fore, attr, "")
+            if isinstance(getattr(Style, attr, ""), str):
+                setattr(Style, attr, "")
 
-    for url, cat_idx in param_matrix():
-        label = f"{host_short(url)}-cat{cat_idx}"
-        sys.stdout.write(f"{label:<25} … "); sys.stdout.flush()
-        start = time.time()
-        try:
-            run_quiz(url, cat_idx)
-        except SkipTest as ex:
-            verdict, colour = "SKIP", C_SKIP
-            detail = str(ex)
-        except Exception as ex:  # hard fail
-            verdict, colour = "FAIL", C_FAIL
-            detail = str(ex)
-        else:
-            verdict, colour = "PASS", C_PASS
-            detail = ""
-        elapsed = time.time() - start
-        print(f"{colour}{verdict}{C_RESET}  ({elapsed:5.1f}s) {detail}")
-        results.append(Result(url, cat_idx, verdict, detail, elapsed))
+    headless = not args.show
+    all_results: List[Result] = []
+    suite_t0 = time.time()
 
-    # ─ summary ─
-    print("\n──── Summary ─────────────────────────────────────────────")
-    total_time = time.time() - total_start
-    for r in results:
-        if r.verdict != "PASS":
-            print(f"{r.verdict:<4}  {host_short(r.url)} cat#{r.category}: {r.detail}")
+    try:
+        for url, cat in _case_matrix():
+            label = f"{_host_short(url)}-cat{cat}"
+            log = StepLog()
+            t0 = time.time()
+            try:
+                run_quiz(url, cat, log, headless)
+            except SkipTest as ex:
+                verdict, detail = "SKIP", str(ex)
+            except Exception as ex:
+                verdict, detail = "FAIL", _short_exc(ex)
+            else:
+                verdict, detail = "PASS", ""
+            elapsed = time.time() - t0
+            res = Result(url, cat, verdict, detail, elapsed, log)
+            _print_result(label, res)
+            all_results.append(res)
+    except KeyboardInterrupt:
+        print("\n▶  Interrupted by user – summarising…\n")
 
-    passes = sum(r.verdict == "PASS" for r in results)
-    fails = sum(r.verdict == "FAIL" for r in results)
-    skips = sum(r.verdict == "SKIP" for r in results)
+    # summary
+    passed = sum(r.verdict == "PASS" for r in all_results)
+    failed = sum(r.verdict == "FAIL" for r in all_results)
+    skipped = sum(r.verdict == "SKIP" for r in all_results)
     print(
-        f"\n{C_PASS}{passes} passed{C_RESET}, "
-        f"{C_FAIL}{fails} failed{C_RESET}, "
-        f"{C_SKIP}{skips} skipped{C_RESET}  •  total {total_time:0.1f}s"
+        f"\n{_colour(str(passed), Fore.GREEN)} passed, "
+        f"{_colour(str(failed), Fore.RED)} failed, "
+        f"{_colour(str(skipped), Fore.YELLOW)} skipped "
+        f"• total {time.time() - suite_t0:0.1f}s"
     )
-    if fails:
-        sys.exit(1)
+    sys.exit(130 if failed == 0 and skipped == 0 else (1 if failed else 0))
 
 
 if __name__ == "__main__":
