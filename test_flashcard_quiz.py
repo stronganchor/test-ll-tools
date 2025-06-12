@@ -1,12 +1,13 @@
 """
-Language-Learner-Tools flashcard smoke-tests.
+Language-Learner-Tools flash-card quiz smoke-tests.
 
 Headless (default) ........ pytest -v
-Visible browser ............ set LLTOOLS_HEADLESS=0  &&  pytest -v
+Visible browser ............ set LLTOOLS_HEADLESS=0 && pytest -v
 """
 from contextlib import contextmanager
 import os
 import time
+from urllib.parse import urlparse
 
 import pytest
 from selenium.common.exceptions import (
@@ -24,17 +25,17 @@ from webdriver_manager.chrome import ChromeDriverManager
 # ───────── CONFIG ──────────────────────────────────────────────────────────
 
 QUIZ_PAGES = [
-    "https://starter-english-test.local/home/",           # dev site first
+    "https://starter-english-test.local/home/",          # dev site first
     "https://www.turkishtextbook.com/vocab-lessons/",
     "https://starterenglish.com/",
     "https://wordboat.com/biblical-hebrew/",
 ]
 
-MAX_CATEGORY_TESTS = 5            # test first 4 categories per site
-ROUNDS_PER_RUN = 3
-MAX_PAGE_LOAD_SEC = 20
-MAX_ROUND_SEC = 25               # per round
-ROUND_START_DELAY = 2            # seconds after audio≥0.4 s
+MAX_CATEGORY_TESTS = 4           # first N categories per site
+ROUNDS_PER_RUN     = 3
+MAX_PAGE_LOAD_SEC  = 20
+MAX_ROUND_SEC      = 25
+ROUND_START_DELAY  = 0.2         # seconds after audio ≥0.4 s
 
 # ───────── BROWSER ─────────────────────────────────────────────────────────
 
@@ -47,13 +48,10 @@ def browser(headless: bool | None = None):
     opts = ChromeOptions()
     if headless:
         opts.add_argument("--headless=new")
-
-    # Silence Chrome console spam
-    opts.add_argument("--log-level=3")
-    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-
     opts.add_argument("--window-size=1400,1000")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--log-level=3")
+    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
 
     drv = Chrome(service=Service(ChromeDriverManager().install()), options=opts)
     try:
@@ -61,11 +59,14 @@ def browser(headless: bool | None = None):
     finally:
         drv.quit()
 
-# ───────── HELPER FUNCTIONS ────────────────────────────────────────────────
+# ───────── HELPERS ─────────────────────────────────────────────────────────
 
 
 def fail(url, cat_idx, round_no, msg):
-    pytest.fail(f"{url}  [cat #{cat_idx}]  round {round_no}: {msg}", pytrace=False)
+    full = f"{url}  [cat #{cat_idx}]  round {round_no}: {msg}"
+    # printing ensures the message shows up in stdout for the failing test
+    print(full, flush=True)
+    pytest.fail(full)                 # no pytrace=False → message in summary
 
 
 def wait_click(driver, by, value, timeout=MAX_PAGE_LOAD_SEC):
@@ -119,10 +120,9 @@ def choose_single_category(driver, idx: int):
     if idx >= len(checkboxes):
         pytest.skip(f"Site shows only {len(checkboxes)} categories (wanted #{idx})")
 
-    for cb in checkboxes:                  # uncheck all
+    for cb in checkboxes:           # uncheck all
         if cb.is_selected():
             cb.click()
-
     checkboxes[idx].click()
 
     start_btn = driver.find_element(By.ID, "ll-tools-start-selected-quiz")
@@ -143,8 +143,15 @@ def early_click_first_card(driver):
 
 # ───────── PARAMETRISED TESTS ──────────────────────────────────────────────
 
+def _param_id(val):
+    url, cat = val
+    host = urlparse(url).hostname or "site"
+    host = host.replace("www.", "").split(".")[0]  # keep it short
+    return f"{host}-cat{cat}"
+
+
 test_matrix = [
-    (url, cat_idx)
+    pytest.param(url, cat_idx, id=_param_id((url, cat_idx)))
     for url in QUIZ_PAGES
     for cat_idx in range(MAX_CATEGORY_TESTS)
 ]
@@ -166,7 +173,7 @@ def test_flashcard_quiz(url, category_index):
             if not WebDriverWait(d, MAX_ROUND_SEC).until(flashcards_visible):
                 fail(url, category_index, round_no, "flashcards never appeared")
 
-            early_click_first_card(d)           # simulate race click
+            early_click_first_card(d)           # simulate race–condition click
             wait_pointer_events_enabled(d)
             wait_audio_played(d, 0.4)
             time.sleep(ROUND_START_DELAY)
@@ -175,7 +182,6 @@ def test_flashcard_quiz(url, category_index):
             while time.time() - start_ts < MAX_ROUND_SEC:
                 cards = d.find_elements(By.CSS_SELECTOR, ".flashcard-container")
                 nothing_clicked = True
-
                 for card in cards:
                     try:
                         if card.is_displayed():
